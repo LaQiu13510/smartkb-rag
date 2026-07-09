@@ -14,7 +14,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from config import TOP_K_RETRIEVAL
+from cache_store import get_cache_store, make_query_cache_key
+from config import QUERY_CACHE_ENABLED, QUERY_CACHE_TTL_SECONDS, TOP_K_RETRIEVAL
 from database.milvus_store import get_milvus_store
 from database.postgres_store import get_postgres_store
 from models.embedding import get_embedding_model
@@ -104,6 +105,47 @@ def list_documents() -> list[dict[str, Any]]:
     ]
 
 
+def cache_stats() -> dict[str, Any]:
+    try:
+        stats = get_cache_store().stats()
+        return {
+            **stats,
+            "enabled": QUERY_CACHE_ENABLED,
+            "ttl_seconds": QUERY_CACHE_TTL_SECONDS,
+        }
+    except Exception as exc:
+        return {
+            "backend": "unavailable",
+            "enabled": QUERY_CACHE_ENABLED,
+            "keys": 0,
+            "error": str(exc)[:180],
+        }
+
+
+def persist_chat(
+    session_id: str,
+    query_text: str,
+    answer: str,
+    sources: list[str],
+    latency_ms: float,
+) -> None:
+    try:
+        get_postgres_store().add_chat(
+            session_id=session_id,
+            role="user",
+            content=query_text,
+        )
+        get_postgres_store().add_chat(
+            session_id=session_id,
+            role="assistant",
+            content=answer,
+            sources=", ".join(sources),
+            latency_ms=latency_ms,
+        )
+    except Exception:
+        pass
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     return HTMLResponse(INDEX_HTML)
@@ -116,8 +158,9 @@ def health() -> dict[str, Any]:
         safe_call("PostgreSQL", lambda: f"{len(list_documents())} documents"),
         safe_call("Embedding", lambda: get_embedding_model().test_connection()[1]),
         safe_call("LLM", lambda: get_llm(max_tokens=64).test_connection()[1]),
+        safe_call("Cache", lambda: cache_stats()),
     ]
-    return {"checks": checks}
+    return {"checks": checks, "cache": cache_stats()}
 
 
 @app.get("/api/documents")
@@ -129,36 +172,66 @@ def documents() -> dict[str, Any]:
         return {"ok": False, "error": str(exc)[:220], "documents": []}
 
 
+@app.get("/api/cache")
+def cache() -> dict[str, Any]:
+    return {"cache": cache_stats()}
+
+
 @app.post("/api/query")
 def query(request: QueryRequest) -> dict[str, Any]:
     start = time.time()
     try:
+        cache_key = make_query_cache_key(request.query, request.top_k)
+        if QUERY_CACHE_ENABLED:
+            try:
+                cached = get_cache_store().get_json(cache_key)
+            except Exception:
+                cached = None
+            if cached:
+                elapsed = round((time.time() - start) * 1000, 1)
+                cached_latency = cached.get("latency_ms", 0)
+                result = {
+                    **cached,
+                    "latency_ms": elapsed,
+                    "cached_latency_ms": cached_latency,
+                    "cache_hit": True,
+                    "cache": {"hit": True, "key": cache_key, **cache_stats()},
+                }
+                persist_chat(
+                    request.session_id,
+                    request.query,
+                    result.get("answer", ""),
+                    result.get("sources", []),
+                    elapsed,
+                )
+                return result
+
         retriever = build_retriever()
         results = retriever.search(request.query, top_k=request.top_k)
         answer = get_rag_chain().answer(request.query, results)
         elapsed = round((time.time() - start) * 1000, 1)
-        try:
-            get_postgres_store().add_chat(
-                session_id=request.session_id,
-                role="user",
-                content=request.query,
-            )
-            get_postgres_store().add_chat(
-                session_id=request.session_id,
-                role="assistant",
-                content=answer["answer"],
-                sources=", ".join(answer.get("sources", [])),
-                latency_ms=elapsed,
-            )
-        except Exception:
-            pass
-        return {
+        persist_chat(
+            request.session_id,
+            request.query,
+            answer["answer"],
+            answer.get("sources", []),
+            elapsed,
+        )
+        result = {
             "ok": True,
             "answer": answer["answer"],
             "sources": answer.get("sources", []),
             "results": results,
             "latency_ms": elapsed,
+            "cache_hit": False,
+            "cache": {"hit": False, "key": cache_key, **cache_stats()},
         }
+        if QUERY_CACHE_ENABLED:
+            try:
+                get_cache_store().set_json(cache_key, result, QUERY_CACHE_TTL_SECONDS)
+            except Exception:
+                pass
+        return result
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:500], "answer": "", "sources": [], "results": [], "latency_ms": 0}
 
@@ -240,7 +313,16 @@ def index_text(request: TextIndexRequest) -> dict[str, Any]:
             chunk_count=len(chunks),
             total_chars=len(request.content),
         )
-        return {"ok": True, "file_name": file_name, "chunks": len(chunks)}
+        try:
+            cache_invalidated = get_cache_store().delete_prefix("query:")
+        except Exception:
+            cache_invalidated = 0
+        return {
+            "ok": True,
+            "file_name": file_name,
+            "chunks": len(chunks),
+            "cache_invalidated": cache_invalidated,
+        }
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:500]}
 
@@ -526,9 +608,9 @@ INDEX_HTML = r"""
       events.addEventListener("final", event => {
         streamDone = true;
         const data = JSON.parse(event.data);
-        setMetric("metric-latency", `${data.latency_ms} ms`);
+        setMetric("metric-latency", `${data.latency_ms} ms${data.cache_hit ? " · cache" : ""}`);
         setMetric("metric-sources", (data.sources || []).length);
-        stateBox.textContent = "完成";
+        stateBox.textContent = data.cache_hit ? "完成 · 缓存命中" : "完成";
         document.getElementById("sources").innerHTML = (data.sources || []).map(src =>
           `<span class="source-chip">${escapeHtml(src)}</span>`
         ).join("") || "<div class='muted'>无来源。</div>";

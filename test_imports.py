@@ -39,10 +39,12 @@ def check_config():
     assert config.DATA_DIR.exists()
     assert config.CHUNK_SIZE > 0
     assert config.TOP_K_RETRIEVAL > 0
+    assert config.QUERY_CACHE_TTL_SECONDS > 0
     return f"root={config.ROOT_DIR}"
 
 
 def check_core_imports():
+    import cache_store  # noqa: F401
     import agent.graph  # noqa: F401
     import agent.tools  # noqa: F401
     import database.milvus_store  # noqa: F401
@@ -57,6 +59,20 @@ def check_core_imports():
     import rag.splitter  # noqa: F401
 
     return "core modules imported without creating live clients"
+
+
+def check_query_cache():
+    from cache_store import InMemoryTTLCacheStore, make_query_cache_key
+
+    cache = InMemoryTTLCacheStore("offline")
+    key = make_query_cache_key("RAG 混合检索", top_k=3)
+    cache.set_json(key, {"answer": "cached", "sources": ["rag.md"]}, ttl_seconds=60)
+    hit = cache.get_json(key)
+    assert hit and hit["answer"] == "cached"
+    assert cache.stats()["keys"] == 1
+    assert cache.delete_prefix("query:") == 1
+    assert cache.get_json(key) is None
+    return "query cache ok"
 
 
 def check_document_pipeline():
@@ -139,6 +155,7 @@ def live_checks():
 def main():
     step("配置加载", check_config)
     step("核心模块导入", check_core_imports)
+    step("热门查询缓存", check_query_cache)
     step("文档切分流水线", check_document_pipeline)
     step("BM25 离线检索", check_bm25_retrieval)
 

@@ -57,6 +57,14 @@ TOP_K_RETRIEVAL = int(os.getenv("TOP_K_RETRIEVAL", "5"))  # 检索返回数量
 VECTOR_DIM = int(os.getenv("VECTOR_DIM", "1024"))      # 向量维度 (智谱 embedding-2=1024)
 
 # ============================================================
+# 缓存配置
+# ============================================================
+REDIS_URL = os.getenv("REDIS_URL", "")
+CACHE_BACKEND = os.getenv("CACHE_BACKEND", "auto").lower()
+QUERY_CACHE_ENABLED = os.getenv("QUERY_CACHE_ENABLED", "true").lower() == "true"
+QUERY_CACHE_TTL_SECONDS = int(os.getenv("QUERY_CACHE_TTL_SECONDS", "600"))
+
+# ============================================================
 # LangSmith 追踪 (可选)
 # ============================================================
 LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"

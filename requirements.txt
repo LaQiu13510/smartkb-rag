@@ -35,6 +35,7 @@ tiktoken>=0.7.0
 numpy>=1.26.0
 pandas>=2.1.0
 httpx>=0.27.0
+redis>=5.0.0
 
 # --- 混合检索 ---
 rank-bm25>=0.2.0
